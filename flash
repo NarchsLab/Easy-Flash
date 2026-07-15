@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import xml.etree.ElementTree as ET
+import difflib
+
+VALID_FLAGS = ['--keep-data', '-k', '--directory', '-d', '--help', '-h']
+
+HELP_MENU = """
+=========================================
+          FLASHING MADE EASY             
+=========================================
+Usage:
+  flash [options]
+
+Options:
+  -k, --keep-data     Skips erasing the "userdata" partition to preserve your files.
+  -d, --directory     Specify a folder containing the flash files.
+                      Defaults to the current directory.
+  -h, --help          Show this helpful screen.
+
+Examples:
+  flash
+  flash --keep-data
+  flash -d "C:\\Users\\Neko\\Downloads\\rom" -k
+=========================================
+"""
+
+def verify_fastboot_installed():
+    """Checks if fastboot is available in the system PATH."""
+    try:
+        # Run fastboot with --version to check if it's installed and accessible
+        subprocess.run(['fastboot', '--version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        print("=" * 70)
+        print("[ERROR] 'fastboot' utility was not found on your system!")
+        print("=" * 70)
+        print("To use this script, you must have Android Platform Tools installed.")
+        print("\n1. Download the Platform Tools for your operating system here:")
+        print("   https://developer.android.com/tools/releases/platform-tools")
+        print("2. Extract the files.")
+        print("3. Add the extracted directory to your system's PATH environment variable.")
+        print("=" * 70)
+        sys.exit(1)
+
+def show_help_and_exit(error_msg=None):
+    if error_msg:
+        print(f"[ERROR] {error_msg}\n")
+    print(HELP_MENU)
+    sys.exit(0 if not error_msg else 1)
+
+def suggest_correction(arg):
+    if arg.startswith('-'):
+        matches = difflib.get_close_matches(arg, VALID_FLAGS, n=1, cutoff=0.5)
+        if matches:
+            return matches[0]
+    return None
+
+def parse_arguments():
+    args = sys.argv[1:]
+    parsed = {
+        'keep_data': False,
+        'directory': os.getcwd()
+    }
+    
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        actual_flag = arg
+        
+        if arg not in VALID_FLAGS:
+            correction = suggest_correction(arg)
+            if correction:
+                print(f"[INFO] Auto-corrected typo '{arg}' to '{correction}'")
+                actual_flag = correction
+            else:
+                show_help_and_exit(f"Unknown flag: '{arg}'")
+                
+        if actual_flag in ['-h', '--help']:
+            show_help_and_exit()
+            
+        elif actual_flag in ['-k', '--keep-data']:
+            parsed['keep_data'] = True
+            
+        elif actual_flag in ['-d', '--directory']:
+            if i + 1 >= len(args):
+                show_help_and_exit("The directory flag requires a folder path after it.")
+            parsed['directory'] = args[i + 1]
+            i += 1
+            
+        i += 1
+        
+    return parsed
+
+def find_flash_file(target_dir):
+    try:
+        for file in os.listdir(target_dir):
+            if file.lower().endswith('.xml') and 'flash' in file.lower():
+                return os.path.join(target_dir, file)
+    except FileNotFoundError:
+        print(f"[ERROR] Specified directory does not exist: '{target_dir}'")
+        sys.exit(1)
+    return None
+
+def run_command(cmd):
+    print(f"\n--> Running: {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"\n[ERROR] Command failed with exit code {e.returncode}")
+        sys.exit(1)
+
+def main():
+    # Verify fastboot is installed before trying to do anything else
+    verify_fastboot_installed()
+
+    options = parse_arguments()
+    target_dir = os.path.abspath(options['directory'])
+    xml_file = find_flash_file(target_dir)
+    
+    if not xml_file:
+        print(f"[ERROR] No flashing XML file found in: '{target_dir}'")
+        sys.exit(1)
+        
+    os.chdir(target_dir)
+    print(f"[INFO] Target Directory: {target_dir}")
+    print(f"[INFO] Found flash file: {os.path.basename(xml_file)}")
+    
+    try:
+        tree = ET.parse(xml_file)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        print(f"[ERROR] Failed to parse XML file: {e}")
+        sys.exit(1)
+        
+    steps = root.find('steps')
+    if steps is None:
+        print("[ERROR] No <steps> section found in the XML.")
+        sys.exit(1)
+        
+    total_steps = len(steps)
+    print(f"[INFO] Found {total_steps} flashing steps. Starting process...")
+    
+    for idx, step in enumerate(steps, 1):
+        op = step.attrib.get('operation')
+        partition = step.attrib.get('partition')
+        filename = step.attrib.get('filename')
+        var = step.attrib.get('var')
+        
+        if options['keep_data'] and op == 'erase' and partition == 'userdata':
+            print(f"\n[{idx}/{total_steps}] [SKIPPED] Erase userdata (Preserving your data!)")
+            continue
+            
+        cmd = ['fastboot']
+        print(f"\n[{idx}/{total_steps}] Processing step: {op}...")
+
+        if op == "getvar":
+            cmd += ['getvar', var]
+        elif op == "oem":
+            cmd += ['oem'] + var.split()
+        elif op == "flash":
+            if not filename or not partition:
+                continue
+            if not os.path.exists(filename):
+                print(f"[ERROR] Required file '{filename}' is missing from directory!")
+                sys.exit(1)
+            cmd += ['flash', partition, filename]
+        elif op == "erase":
+            if not partition:
+                continue
+            cmd += ['erase', partition]
+        else:
+            continue
+            
+        run_command(cmd)
+
+    print("\n[SUCCESS] Flashing sequence completed successfully!")
+
+if __name__ == "__main__":
+    main()
