@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 import os
 import sys
+import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 import difflib
 
-VALID_FLAGS = ['--keep', '-k', '--directory', '-d', '--help', '-h']
+VALID_FLAGS = ['--keep', '-k', '--directory', '-d', '--switch-path', '-s', '--payload-bin', '-p', '--help', '-h']
 
-HELP_MENU = """
-=========================================
-          FLASHING MADE EASY             
+# Partitions we'll try to pull out of a payload.bin. magiskboot has no
+# "list partitions" command, so this is a curated list of the ones that
+# commonly show up in OTA payloads - anything not in this list won't be
+# extracted automatically.
+COMMON_PAYLOAD_PARTITIONS = [
+    'boot', 'init_boot', 'vendor_boot', 'dtbo',
+    'vbmeta', 'vbmeta_system', 'vbmeta_vendor',
+    'super', 'system', 'vendor', 'product', 'system_ext',
+]
+
+HELP_MENU = """                                 =========================================
+          FLASHING MADE EASY
 =========================================
 Usage:
   flash [options]
@@ -20,6 +30,13 @@ Options:
                             (e.g. -k userdata -k cache).
   -d, --directory          Specify a folder containing the flash files.
                             Defaults to the current directory.
+  -s, --switch-path <dir>  Termux only. Moves this script into <dir> and
+                            adds <dir> to your PATH. Only needs root if
+                            <dir> isn't writable without it.
+  -p, --payload-bin <file> Extract known partitions from an OTA payload.bin
+                            (using 'mb', a renamed magiskboot binary that
+                            must be on your PATH) and fastboot-flash each
+                            one by its partition name.
   -h, --help                Show this helpful screen.
 
 Examples:
@@ -27,6 +44,8 @@ Examples:
   flash --keep userdata
   flash -k userdata -k cache
   flash -d "C:\\Users\\Neko\\Downloads\\rom" -k userdata
+  flash -s /data/data/com.termux/files/usr/bin
+  flash -p payload.bin
 =========================================
 """
 
@@ -64,14 +83,16 @@ def parse_arguments():
     args = sys.argv[1:]
     parsed = {
         'keep': set(),
-        'directory': os.getcwd()
+        'directory': os.getcwd(),
+        'switch_path': None,
+        'payload_bin': None
     }
-    
+
     i = 0
     while i < len(args):
         arg = args[i]
         actual_flag = arg
-        
+
         if arg not in VALID_FLAGS:
             correction = suggest_correction(arg)
             if correction:
@@ -79,26 +100,184 @@ def parse_arguments():
                 actual_flag = correction
             else:
                 show_help_and_exit(f"Unknown flag: '{arg}'")
-                
+
         if actual_flag in ['-h', '--help']:
             show_help_and_exit()
-            
+
         elif actual_flag in ['-k', '--keep']:
             if i + 1 >= len(args):
                 show_help_and_exit("The keep flag requires a partition name after it.")
             partition = args[i + 1]
             parsed['keep'].add(partition)
             i += 1
-            
+
         elif actual_flag in ['-d', '--directory']:
             if i + 1 >= len(args):
                 show_help_and_exit("The directory flag requires a folder path after it.")
             parsed['directory'] = args[i + 1]
             i += 1
-            
+
+        elif actual_flag in ['-s', '--switch-path']:
+            if i + 1 >= len(args):
+                show_help_and_exit("The switch-path flag requires a destination path after it.")
+            parsed['switch_path'] = args[i + 1]
+            i += 1
+
+        elif actual_flag in ['-p', '--payload-bin']:
+            if i + 1 >= len(args):
+                show_help_and_exit("The payload-bin flag requires a path to a payload.bin file after it.")
+            parsed['payload_bin'] = args[i + 1]
+            i += 1
+
         i += 1
-        
+
     return parsed
+
+def is_termux():
+    """Best-effort detection of a Termux (Android) environment. Checks
+    several independent signals so it doesn't depend on any single
+    environment variable being exported."""
+    if os.environ.get('TERMUX_VERSION'):
+        return True
+    if '/com.termux/' in os.environ.get('PREFIX', ''):
+        return True
+    if '/com.termux/' in os.environ.get('HOME', ''):
+        return True
+    if os.path.isdir('/data/data/com.termux/files/usr'):
+        return True
+    return False
+
+def add_dir_to_path(target_dir):
+    """Append a PATH export for target_dir to the user's shell rc file,
+    if it isn't already there."""
+    shell_name = os.path.basename(os.environ.get('SHELL', 'bash'))
+    rc_name = '.zshrc' if shell_name == 'zsh' else '.bashrc'
+    home = os.environ.get('HOME', os.path.expanduser('~'))
+    rc_path = os.path.join(home, rc_name)
+
+    existing = ""
+    if os.path.exists(rc_path):
+        try:
+            with open(rc_path, 'r') as f:
+                existing = f.read()
+        except OSError as e:
+            print(f"[WARN] Could not read {rc_path}: {e}")
+
+    if target_dir in existing:
+        print(f"[INFO] {rc_path} already references {target_dir} - leaving it as is.")
+        return
+
+    export_line = f'export PATH="$PATH:{target_dir}"\n'
+    try:
+        with open(rc_path, 'a') as f:
+            f.write(f'\n# Added by flash --switch-path\n{export_line}')
+        print(f"[INFO] Added {target_dir} to PATH via {rc_path}")
+    except OSError as e:
+        print(f"[ERROR] Could not update {rc_path}: {e}")
+        print("Add this line to your shell rc file manually:")
+        print(f"  {export_line.strip()}")
+
+def _require_root_and_retry(target_path):
+    print("=" * 70)
+    print("[ERROR] Permission denied.")
+    print(f"'{target_path}' isn't writable without root. Re-run as root, e.g.:")
+    print(f"  su -c \"flash -s '{target_path}'\"")
+    print("=" * 70)
+    sys.exit(1)
+
+def switch_path(target_path):
+    """Move this running script into target_path and add target_path to
+    PATH. Termux-only. Only requires root if target_path actually needs
+    it to write to - it just tries the operation and asks for root if
+    that attempt hits a permission error."""
+    if not is_termux():
+        print("=" * 70)
+        print("[ERROR] --switch-path only works on Termux (Android).")
+        print("It is not supported on regular Linux.")
+        print("=" * 70)
+        sys.exit(1)
+
+    target_dir = os.path.abspath(os.path.expanduser(target_path))
+
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except PermissionError:
+        _require_root_and_retry(target_path)
+    except OSError as e:
+        print(f"[ERROR] Could not create directory '{target_dir}': {e}")
+        sys.exit(1)
+
+    current_script = os.path.realpath(__file__)
+    dest = os.path.join(target_dir, os.path.basename(current_script))
+
+    if os.path.abspath(current_script) == os.path.abspath(dest):
+        print(f"[INFO] Script is already at {dest}")
+    else:
+        try:
+            shutil.move(current_script, dest)
+            os.chmod(dest, 0o755)
+            print(f"[INFO] Moved script to: {dest}")
+        except PermissionError:
+            _require_root_and_retry(target_path)
+        except OSError as e:
+            print(f"[ERROR] Could not move script to '{dest}': {e}")
+            sys.exit(1)
+
+    add_dir_to_path(target_dir)
+
+    print("[SUCCESS] Done. Restart your shell (or 'source' your rc file) for the updated PATH to take effect.")
+    sys.exit(0)
+
+def flash_payload_bin(payload_path):
+    """Extract known partitions from an OTA payload.bin using 'mb' (a
+    renamed magiskboot binary) and fastboot-flash each one that came out.
+
+    magiskboot's 'extract' subcommand pulls one named partition at a time
+    and has no built-in way to list or dump everything in one call, so
+    this tries a curated list of common partition names and flashes
+    whichever ones actually existed in the payload."""
+    mb_path = shutil.which('mb')
+    if not mb_path:
+        print("=" * 70)
+        print("[ERROR] 'mb' (magiskboot) was not found on your PATH.")
+        print("Install it via the install.sh 'payload.bin support' option, or")
+        print("place a 'libmagiskboot.so' from the Magisk APK on your PATH as 'mb'.")
+        print("=" * 70)
+        sys.exit(1)
+
+    payload_path = os.path.abspath(os.path.expanduser(payload_path))
+    if not os.path.isfile(payload_path):
+        print(f"[ERROR] payload.bin not found: '{payload_path}'")
+        sys.exit(1)
+
+    work_dir = os.path.join(os.path.dirname(payload_path), '.flash-payload-extract')
+    os.makedirs(work_dir, exist_ok=True)
+
+    print(f"[INFO] Extracting known partitions from: {payload_path}")
+    extracted = {}
+    for partition in COMMON_PAYLOAD_PARTITIONS:
+        out_file = os.path.join(work_dir, f"{partition}.img")
+        result = subprocess.run(
+            [mb_path, 'extract', payload_path, partition, out_file],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        if result.returncode == 0 and os.path.isfile(out_file) and os.path.getsize(out_file) > 0:
+            extracted[partition] = out_file
+            print(f"  [FOUND] {partition}")
+
+    if not extracted:
+        print("[ERROR] None of the common partitions were found in this payload.bin.")
+        print(f"Checked for: {', '.join(COMMON_PAYLOAD_PARTITIONS)}")
+        shutil.rmtree(work_dir, ignore_errors=True)
+        sys.exit(1)
+
+    print(f"\n[INFO] Extracted {len(extracted)} partition(s). Flashing now...")
+    for partition, img_path in extracted.items():
+        run_command(['fastboot', 'flash', partition, img_path])
+
+    shutil.rmtree(work_dir, ignore_errors=True)
+    print("\n[SUCCESS] payload.bin flashing sequence completed successfully!")
+    sys.exit(0)
 
 def find_flash_file(target_dir):
     try:
@@ -119,48 +298,60 @@ def run_command(cmd):
         sys.exit(1)
 
 def main():
+    options = parse_arguments()
+
+    # --switch-path is a standalone action, unrelated to flashing, so it's
+    # handled before the fastboot check and short-circuits the rest of main().
+    if options['switch_path']:
+        switch_path(options['switch_path'])
+        return
+
     # Verify fastboot is installed before trying to do anything else
     verify_fastboot_installed()
 
-    options = parse_arguments()
+    # --payload-bin is also a standalone action - extract + flash, then stop.
+    if options['payload_bin']:
+        flash_payload_bin(options['payload_bin'])
+        return
+
     target_dir = os.path.abspath(options['directory'])
     xml_file = find_flash_file(target_dir)
-    
+
     if not xml_file:
         print(f"[ERROR] No flashing XML file found in: '{target_dir}'")
         sys.exit(1)
-        
+
     os.chdir(target_dir)
     print(f"[INFO] Target Directory: {target_dir}")
     print(f"[INFO] Found flash file: {os.path.basename(xml_file)}")
     if options['keep']:
         print(f"[INFO] Partitions to preserve: {', '.join(sorted(options['keep']))}")
-    
+
     try:
         tree = ET.parse(xml_file)
         root = tree.getroot()
     except ET.ParseError as e:
         print(f"[ERROR] Failed to parse XML file: {e}")
         sys.exit(1)
-        
+
     steps = root.find('steps')
     if steps is None:
         print("[ERROR] No <steps> section found in the XML.")
         sys.exit(1)
-        
+
     total_steps = len(steps)
     print(f"[INFO] Found {total_steps} flashing steps. Starting process...")
-    
+
     for idx, step in enumerate(steps, 1):
         op = step.attrib.get('operation')
         partition = step.attrib.get('partition')
         filename = step.attrib.get('filename')
         var = step.attrib.get('var')
-        
+
         if op == 'erase' and partition in options['keep']:
             print(f"\n[{idx}/{total_steps}] [SKIPPED] Erase {partition} (Preserving your data!)")
             continue
-            
+
         cmd = ['fastboot']
         print(f"\n[{idx}/{total_steps}] Processing step: {op}...")
 
@@ -181,7 +372,7 @@ def main():
             cmd += ['erase', partition]
         else:
             continue
-            
+
         run_command(cmd)
 
     print("\n[SUCCESS] Flashing sequence completed successfully!")
